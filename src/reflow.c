@@ -17,7 +17,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-// modified by akita11 (akita@ifdl.jp), 2022/02/14: P control and keep temperature for specified period
+// modified by akita11 (akita@ifdl.jp), 2022/02/16: PID control and keep temperature for specified period
 
 #include "LPC214x.h"
 #include <stdint.h>
@@ -33,29 +33,25 @@
 #include "sensor.h"
 #include "reflow.h"
 
-/*
-{ T1a, T1b, s1, t1, r1, 
+uint8_t reflow_state = 0;
 
-wait until temperature reaches T1a with speed of s1, ramp=r1 -> keep [T1a, T1b] for t1
-wait until temperature reaches T2a with speed of s2, ramp=r2 -> keep [T2a, T2b] for t2
+/*
+{ T1a, T1b, t1 }
+
+control heatr&fan for temperature going T1a, when temperature reaches T1b, retain for t1
 */
 
-uint8_t reflow_state = 0;
 uint16_t reflow_profile[] = {
-  150, 190, 255, 100, 1, 
-  250, 260, 255,  10, 1, 
-   50,  40, 255,   1, 2
-  /*
-  190, 100,
-  260, 10,
-  50, 1,
-  */
+  190, 150, 100,
+  240, 230, 10,
+  50, 80, 20,
 };
-uint8_t num_reflow_state = sizeof(reflow_profile) / sizeof(uint16_t) / 5;
-uint16_t target_temp_a = 0, target_temp_b = 0;
-//uint16_t target_temp = 0;
+uint8_t num_reflow_state = sizeof(reflow_profile) / sizeof(uint16_t) / 3;
+uint16_t target_temp = 0;
+uint16_t threshold_temp = 0;
 uint8_t f_retain = 0;
 uint32_t thetime_retain_start = 0;
+uint16_t duration = 0;
 
 // Standby temperature in degrees Celsius
 #define STANDBYTEMP (50)
@@ -88,12 +84,13 @@ static int32_t Reflow_Work(void) {
 	avgtemp = Sensor_GetTemp(TC_AVERAGE);
 
 	const char* modestr = "UNKNOWN";
-
+	//uint32_t out;
+	int16_t out;
 	// Depending on mode we should run this with different parameters
 	if (mymode == REFLOW_STANDBY || mymode == REFLOW_STANDBYFAN) {
 		intsetpoint = STANDBYTEMP;
 		// Cool to standby temp but don't heat to get there
-		Reflow_Run(0, avgtemp, &heat, &fan, intsetpoint);
+		Reflow_Run(0, avgtemp, &heat, &fan, intsetpoint, &out);
 		heat = 0;
 
 		// Suppress slow-running fan in standby
@@ -103,11 +100,11 @@ static int32_t Reflow_Work(void) {
 		modestr = "STANDBY";
 
 	} else if(mymode == REFLOW_BAKE) {
-		reflowdone = Reflow_Run(0, avgtemp, &heat, &fan, intsetpoint) ? 1 : 0;
+		reflowdone = Reflow_Run(0, avgtemp, &heat, &fan, intsetpoint, &out) ? 1 : 0;
 		modestr = "BAKE";
 
 	} else if(mymode == REFLOW_REFLOW) {
-		reflowdone = Reflow_Run(ticks, avgtemp, &heat, &fan, 0) ? 1 : 0;
+		reflowdone = Reflow_Run(ticks, avgtemp, &heat, &fan, 0, &out) ? 1 : 0;
 		modestr = "REFLOW";
 
 	} else {
@@ -117,10 +114,11 @@ static int32_t Reflow_Work(void) {
 	Set_Fan(fan);
 
 	if (mymode != oldmode) {
-	  printf("\n# Time, Temp0, Temp1, Temp2, Temp3, Set_a, Set_b, Act'l, st, fr, Heat, Fan, ColdJ, Mode");
+	  printf("\n# Time, Temp0, Temp1, Temp2, Temp3, Set_a, Set_b, Act'l, st, fr, Heat, Fan,   out, ColdJ, Mode");
 	  oldmode = mymode;
 	  numticks = 0;
 	  reflow_state = 0;
+	  PID.ITerm = 0.0;
 	} else if (mymode == REFLOW_BAKE) {
 		if (bake_timer > 0 && numticks >= bake_timer) {
 			printf("\n DONE baking, set bake timer to 0.");
@@ -139,22 +137,32 @@ static int32_t Reflow_Work(void) {
 	}
 
 	if (!(mymode == REFLOW_STANDBY && standby_logging == 0)) {
-	  printf("\n%6.1f, %5.1f, %5.1f, %5.1f, %5.1f, %5.1f, %5.1f, %5.1f, %2d, %2d, %3u, %3u,  %5.1f, %s",
-		 //	  printf("\n%6.1f, %5.1f, %5.1f, %5.1f, %5.1f, %5.1f, %5.1f, %2d, %2d, %3u, %3u,  %5.1f, %s",
+	  //printf("\n%6.1f, %5.1f, %5.1f, %5.1f, %5.1f, %5.1f, %5.1f, %5.1f, %2d, %2d, %3u, %3u,  %5.1f, %s",
+	  //	  printf("\n%6.1f, %5.1f, %5.1f, %5.1f, %5.1f, %5.1f, %5.1f, %2d, %2d, %3u, %3u,  %5d, %5.1f, %s",
+	  /*
+	  printf("\n%6.1f, %5.1f, %5.1f, %5.1f, %3d, %2d, %2d, %3u, %3u,  %5d",
 		 ((float)numticks / TICKS_PER_SECOND),
-		 Sensor_GetTemp(TC_LEFT),
-		 Sensor_GetTemp(TC_RIGHT),
-		 Sensor_GetTemp(TC_EXTRA1),
-		 Sensor_GetTemp(TC_EXTRA2),
-		 //(float)target_temp,
-		 (float)target_temp_a,
-		 (float)target_temp_b,
+		 (float)target_temp,
+		 (float)threshold_temp, 
 		 avgtemp,
+		 duration, 
 		 reflow_state,
 		 f_retain,
-		 heat, fan,
-		 Sensor_GetTemp(TC_COLD_JUNCTION),
-		 modestr);
+		 heat,
+		 fan,
+		 out);
+	  */
+	  printf("\n%6.1f %5.1f %5.1f %5.1f %3d %2d %2d %3u %3u  %5d",
+		 ((float)numticks / TICKS_PER_SECOND),
+		 avgtemp,
+		 (float)target_temp,
+		 (float)threshold_temp, 
+		 duration, 
+		 reflow_state,
+		 f_retain,
+		 heat,
+		 fan,
+		 out);
 	}
 
 	if (numticks & 1) {
@@ -186,7 +194,8 @@ void Reflow_Init(void) {
 	//PID_init(&PID, 20, 0.04, 25, PID_Direction_Direct); // Improvement as far as I can tell, still work in progress
 	PID_init(&PID, 0, 0, 0, PID_Direction_Direct); // Can't supply tuning to PID_Init when not using the default timebase
 	PID_SetSampleTime(&PID, PID_TIMEBASE);
-	PID_SetTunings(&PID, 20, 0.016, 62.5); // Adjusted values to compensate for the incorrect timebase earlier
+	//	PID_SetTunings(&PID, 20, 0.016, 62.5); // Adjusted values to compensate for the incorrect timebase earlier
+	PID_SetTunings(&PID, 30, 0.016, 60); // tentative by akita11
 	//PID_SetTunings(&PID, 80, 0, 0); // This results in oscillations with 14.5s cycle time
 	//PID_SetTunings(&PID, 30, 0, 0); // This results in oscillations with 14.5s cycle time
 	//PID_SetTunings(&PID, 15, 0, 0);
@@ -269,67 +278,46 @@ int Reflow_GetTimeLeft(void) {
 }
 
 // returns -1 if the reflow process is done.
-int32_t Reflow_Run(uint32_t thetime, float meastemp, uint8_t* pheat, uint8_t* pfan, int32_t manualsetpoint) {
+int32_t Reflow_Run(uint32_t thetime, float meastemp, uint8_t* pheat, uint8_t* pfan, int32_t manualsetpoint, int16_t *out_val) {
+	target_temp = reflow_profile[reflow_state * 3 + 0];
+	threshold_temp = reflow_profile[reflow_state * 3 + 1];
+	duration = reflow_profile[reflow_state * 3 + 2];
 
-	
-	target_temp_a = reflow_profile[reflow_state * 5 + 0];
-	target_temp_b = reflow_profile[reflow_state * 5 + 1];
-	uint16_t ramp_speed = reflow_profile[reflow_state * 5 + 2];
-	uint16_t duration = reflow_profile[reflow_state * 5 + 3];
-	uint16_t ramp = reflow_profile[reflow_state * 5 + 4];
+	PID.mySetpoint = (float)target_temp;
+	PID.outMax = 500.0;
+	PID.outMin = -500.0;
+
+	FloatType out = 0.0;
+	PID.myInput = meastemp;
+	PID_Compute(&PID);
+	out = PID.myOutput;
+
 	if (f_retain == 0){
-	  if (ramp == 1){
-	    // temperature rising
-	    if (meastemp > target_temp_a){ f_retain = 1; thetime_retain_start = thetime; }
-	    else{ *pheat = ramp_speed; *pfan = 0; }
-	  }
-	  else{
-	    // temperature falling	    if (meastemp < target_temp) 
-	    if (meastemp < target_temp_a){ f_retain = 1; thetime_retain_start = thetime; }
-	    else{ *pheat = 0; *pfan = ramp_speed; }
-	  }
+	  FloatType Tdiff;
+	  if (meastemp > threshold_temp) Tdiff = meastemp - threshold_temp;
+	  else Tdiff = threshold_temp - meastemp;
+	  if (Tdiff < 2){ f_retain = 1; thetime_retain_start = thetime; }
+	}
+	else if (f_retain == 1 && thetime > thetime_retain_start + duration){
+	  // retain finished
+	  reflow_state++;
+	  f_retain = 0;
+	  PID.ITerm = 0.0;
+	}
+
+	if (out > 0.0){
+	  if (out > 255) *pheat = 255;
+	  else *pheat = (uint8_t)out;
+	  *pfan = 0;
 	}
 	else{
-	  if (thetime_retain_start + duration > thetime){
-	    // in reatin state
-	    if (meastemp > target_temp_b){ *pheat = 0; *pfan = 100; }
-	    else if (meastemp < target_temp_a){ *pheat = 255; *pfan = 0; }
-	    else{ *pheat = 180, *pfan = 0; }
-	  }
-	  else{
-	    // retain finished
-	    reflow_state++; f_retain = 0;
-	  }
+	  FloatType outm = -out;
+	  if (outm > 255) *pfan = 255;
+	  else *pfan = (uint8_t)outm;
+	  *pheat = 0;
 	}
-	/*
-	target_temp = reflow_profile[reflow_state * 2 + 0];
-	uint16_t duration = reflow_profile[reflow_state * 2 + 1];
-	PID.mySetpoint = (float)target_temp;
-	uint32_t out;
-	if (f_retain == 0
-	    || (f_retain == 1 && thetime_retain_start + duration <= thetime)){
-	  PID.myInput = meastemp;
-	  PID_Compute(&PID);
-	  out = PID.myOutput;
-	  if (out < 248) { // Fan in reverse
-	    *pfan = 255 - out;
-	    *pheat = 0;
-	  } else {
-	    *pheat = out - 248;
-	    // When heating like crazy make sure we can reach our setpoint
-	    // if(*pheat>192) { *pfan=2; } else { *pfan=2; }
-	    
-	    // Run at a low fixed speed during heating for now
-	    *pfan = NV_GetConfig(REFLOW_MIN_FAN_SPEED);
-	  }
-	}
-	//	printf("\n%d : out = %d / fan = %d / heat - %d", f_retain, out, *pfan, *pheat);
-	if (*pfan > 255) *pfan = 255;
-	if (*pheat > 255) *pheat = 255;
-	if (f_retain == 1 && thetime_retain_start + duration > thetime){
-	  // retain finished
-	  reflow_state++; f_retain = 0;
-	  }*/
+
+	*out_val = (int16_t)out;
 	
 	if (reflow_state == num_reflow_state) return(-1); else return(0);
 }
