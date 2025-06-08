@@ -42,7 +42,7 @@ control heatr&fan for temperature going T1a, when temperature reaches T1b, retai
 */
 
 uint16_t reflow_profile[] = {
-  190, 150, 100,
+  190, 150, 60,
   240, 230, 10,
   50, 80, 20,
 };
